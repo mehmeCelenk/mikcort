@@ -224,3 +224,7 @@ wss://mikcort-signaling.<your-subdomain>.workers.dev/ws
 ```
 
 Cloudflare backend de sadece signaling yapar. WebRTC sesi peer-to-peer kalir.
+
+## Lisans
+
+Bu proje [MIT Lisansi](LICENSE) altinda yayinlanir.

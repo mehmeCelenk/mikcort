@@ -224,3 +224,7 @@ wss://mikcort-signaling.<your-subdomain>.workers.dev/ws
 ```
 
 The Cloudflare backend is also signaling-only. WebRTC audio remains peer-to-peer.
+
+## License
+
+This project is released under the [MIT License](LICENSE).
