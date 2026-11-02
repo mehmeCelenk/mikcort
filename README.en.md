@@ -109,10 +109,39 @@ cmd /c npm run dev
 
 1. Start one signaling backend.
 2. Start two or more app instances.
-3. Create a room in one instance.
-4. Join the same room ID from the other instances.
-5. Optional: set a room password to hide the room's users in the public room list.
-6. Press **Start microphone** in each instance.
+3. Enter a display name and choose **Create room**.
+4. Click the same room in the room list on the other instances.
+5. For a password-protected room, choose **Room options > Create private room**. Joining prompts for the password, and participants stay hidden in the room list.
+6. The microphone opens automatically. The bottom bar contains microphone, deafen, screen sharing, sound settings, and leave controls.
+
+Change the server address through **Connection settings** on the home screen. Chat opens on the right. Additional sound settings are grouped under **Fine-tune your microphone** and **Keyboard shortcuts**.
+
+Logo sources live in `frontend/public/brand/`. Regenerate desktop icons from the frontend directory with `npm run tauri -- icon public/brand/app-icon.svg -o src-tauri/icons`.
+
+## Screen Sharing Quality
+
+Choose **720p / 1080p** and **30 / 60 FPS** in the screen sharing menu. The default is 1080p 30 FPS, and selections are saved on the device.
+
+| Target quality | Video bitrate ceiling (per peer) |
+| --- | --- |
+| 720p 30 FPS | 3 Mbps |
+| 720p 60 FPS | 5 Mbps |
+| 1080p 30 FPS | 6 Mbps |
+| 1080p 60 FPS | 10 Mbps |
+
+30 FPS profiles prioritize text/detail resolution; 60 FPS profiles balance sharpness and motion. Screen audio has a 128 kbps ceiling. These are targets and ceilings; WebRTC adapts to the connection and hardware. The sharing status shows the source's actual dimensions and FPS setting, rather than measuring the quality received by viewers. The app displays a notice if quality settings cannot be applied.
+
+## Microphone Noise Suppression
+
+**Audio settings > Noise suppression** offers three modes:
+
+- **Off**: no noise suppression.
+- **Standard**: WebRTC's built-in noise suppression.
+- **RNNoise (AI)**: on-device WASM/AudioWorklet processing at 48 kHz mono. This is the default; users who previously disabled noise suppression keep Off.
+
+The RNNoise model and processor ship with the app, so no external service or API key is required. Built-in noise suppression is disabled while RNNoise is selected. If loading or processing fails, the app attempts to enable Standard mode and shows a notice in audio settings. Echo cancellation and automatic gain remain independent settings.
+
+Bundled licenses: [frontend/public/third-party-licenses](frontend/public/third-party-licenses).
 
 ## Checks
 
@@ -125,7 +154,14 @@ go build ./...
 ```powershell
 cd frontend
 cmd /c npm run build
+cmd /c npm run test:audio
+cmd /c npm run test:screen
+cmd /c npm run test:ui
 ```
+
+Screen tests use synthetic video/audio to check quality selection, real WebRTC sender parameters, cancellation/error handling, and 1080p reception by a second local peer. They do not capture the user's screen.
+
+Audio tests use synthetic input in an installed Chrome/Edge browser without opening the physical microphone. Set `MIKCORT_TEST_BROWSER` to a Chromium executable to use another installation. Tests exercise real RNNoise WASM processing under the production CSP, failure recovery, mode changes, and microphone resource cleanup.
 
 ```powershell
 cd backend/cloudflare-signaling

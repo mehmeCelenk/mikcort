@@ -1,5 +1,6 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue';
 import type { RemoteScreenShare } from './types';
+import { screenCaptureLabel, screenShareConstraints, screenShareProfile } from './screenShareQuality';
 
 interface UseScreenShareOptions {
   activeMemberVolumeUser: Ref<string | null>;
@@ -14,6 +15,7 @@ interface UseScreenShareOptions {
   requestPeerOffer: (userId: string, peer: RTCPeerConnection, options?: RTCOfferOptions) => Promise<boolean>;
   screenVolumes: Record<string, number>;
   selectedScreenFps: Ref<number>;
+  selectedScreenResolution: Ref<number>;
   senderSources: WeakMap<RTCRtpSender, 'mic' | 'screen'>;
   status: Ref<string>;
   updateRemoteAudioSettings: () => void;
@@ -33,12 +35,14 @@ export function useScreenShare({
   requestPeerOffer,
   screenVolumes,
   selectedScreenFps,
+  selectedScreenResolution,
   senderSources,
   status,
   updateRemoteAudioSettings,
   ensurePeer,
 }: UseScreenShareOptions) {
   const sharingScreen = ref(false);
+  const screenStarting = ref(false);
   const remoteScreens = ref<RemoteScreenShare[]>([]);
   const activeScreenMenuUser = ref<string | null>(null);
   const fullscreenScreenUser = ref<string | null>(null);
@@ -46,22 +50,15 @@ export function useScreenShare({
   const screenShareMenuOpen = ref(false);
   const screenStream = ref<MediaStream | null>(null);
   const screenVideoElements = new Map<string, HTMLVideoElement>();
+  let captureGeneration = 0;
 
   const viewedScreenShare = computed(() => remoteScreens.value.find((share) => share.userId === viewingScreenUser.value) ?? null);
   const viewedScreenUserId = computed(() => viewedScreenShare.value?.userId ?? '');
 
-  function screenShareVideoConstraints(): MediaTrackConstraints {
-    const fps = normalizedScreenFps();
-    return {
-      frameRate: { ideal: fps, max: fps },
-      width: { ideal: 1280, max: 1920 },
-      height: { ideal: 720, max: 1080 },
-    };
-  }
-
-  function normalizedScreenFps() {
-    return Number(selectedScreenFps.value) >= 60 ? 60 : 30;
-  }
+  const screenShareCaptureLabel = computed(() => {
+    const track = screenStream.value?.getVideoTracks()[0];
+    return track ? screenCaptureLabel(track, screenShareProfile(selectedScreenResolution.value, selectedScreenFps.value)) : '';
+  });
 
   async function toggleScreenShare() {
     if (sharingScreen.value) {
@@ -71,35 +68,78 @@ export function useScreenShare({
     }
   }
 
-  async function startScreenShare(fps = selectedScreenFps.value) {
+  async function startScreenShare() {
+    if (sharingScreen.value || screenStarting.value) {
+      return;
+    }
+    const generation = ++captureGeneration;
+    screenStarting.value = true;
+    let capturedStream: MediaStream | null = null;
     try {
       error.value = '';
-      selectedScreenFps.value = fps === 60 ? 60 : 30;
+      const profile = screenShareProfile(selectedScreenResolution.value, selectedScreenFps.value);
+      selectedScreenFps.value = profile.fps;
+      selectedScreenResolution.value = profile.height;
       screenShareMenuOpen.value = false;
-      const videoConstraints = screenShareVideoConstraints();
-      screenStream.value = await navigator.mediaDevices.getDisplayMedia({
+      const videoConstraints = screenShareConstraints(profile);
+      capturedStream = await navigator.mediaDevices.getDisplayMedia({
         video: videoConstraints,
         audio: true,
       });
+      if (generation !== captureGeneration) {
+        capturedStream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      const [track] = capturedStream.getVideoTracks();
+      if (!track) {
+        throw new Error('The selected source did not provide a video track.');
+      }
+      try {
+        await track.applyConstraints(videoConstraints);
+      } catch {
+        error.value = 'The selected capture quality could not be applied. Using the available quality.';
+      }
+      if (generation !== captureGeneration || track.readyState !== 'live') {
+        capturedStream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      track.contentHint = profile.contentHint;
+      capturedStream.getAudioTracks().forEach((audioTrack) => { audioTrack.contentHint = 'music'; });
+      screenStream.value = capturedStream;
       sharingScreen.value = true;
-      status.value = `Sharing your screen at ${selectedScreenFps.value} FPS.`;
+      status.value = `Sharing your screen: ${screenShareCaptureLabel.value}.`;
       playVoiceFeedback('screen-start');
-
-      const [track] = screenStream.value.getVideoTracks();
-      await track?.applyConstraints(videoConstraints).catch(() => undefined);
       track.addEventListener('ended', () => {
-        void stopScreenShare();
+        if (screenStream.value === capturedStream) {
+          void stopScreenShare();
+        }
       });
 
       for (const userId of otherUsers.value) {
+        if (generation !== captureGeneration) {
+          return;
+        }
         await ensurePeer(userId, true);
       }
     } catch (err) {
-      error.value = err instanceof Error ? err.message : 'Screen share could not start.';
+      capturedStream?.getTracks().forEach((track) => track.stop());
+      if (generation === captureGeneration) {
+        await stopScreenShare();
+        if (!(err instanceof DOMException && err.name === 'AbortError')) {
+          error.value = err instanceof Error ? err.message : 'Screen share could not start.';
+        }
+      }
+    } finally {
+      if (generation === captureGeneration) {
+        screenStarting.value = false;
+      }
     }
   }
 
   async function stopScreenShare() {
+    captureGeneration++;
+    screenStarting.value = false;
+    screenShareMenuOpen.value = false;
     if (!screenStream.value && !sharingScreen.value) {
       return;
     }
@@ -228,12 +268,13 @@ export function useScreenShare({
     attachRemoteScreen,
     fullscreenScreenUser,
     isUserSharingScreen,
-    normalizedScreenFps,
     remoteScreens,
     removeRemoteScreen,
     screenShareBadgeLabel,
+    screenShareCaptureLabel,
     screenShareMenuOpen,
     screenStream,
+    screenStarting,
     setScreenVideoElement,
     sharingScreen,
     startScreenShare,

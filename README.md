@@ -109,10 +109,39 @@ cmd /c npm run dev
 
 1. Bir signaling backend baslat.
 2. Iki veya daha fazla uygulama instance'i ac.
-3. Bir instance'ta oda olustur.
-4. Diger instance'lardan ayni oda ID'sine gir.
-5. Opsiyonel: oda sifresi belirleyerek public oda listesindeki kullanici bilgisini gizle.
-6. Her instance'ta **Start microphone** butonuna bas.
+3. Gorunen adini yaz ve **Create room** ile oda olustur.
+4. Diger instance'larda oda listesinden ayni odaya tikla.
+5. Sifreli oda icin **Room options > Create private room** sec. Katilirken sifre bir pencerede sorulur; oda listesindeki katilimcilar gizli kalir.
+6. Mikrofon otomatik acilir. Alt cubuktan mikrofon, gelen ses, ekran paylasimi ve ses ayarlarina ulasilir.
+
+Sunucu adresi ana ekrandaki **Connection settings** dugmesinden degistirilir. Sohbet odanin saginda acilir; detayli ses ayarlari **Fine-tune your microphone** ve **Keyboard shortcuts** basliklari altindadir.
+
+Logo kaynaklari `frontend/public/brand/` altindadir. Masaustu ikonlarini yenilemek icin frontend dizininde `npm run tauri -- icon public/brand/app-icon.svg -o src-tauri/icons` calistir.
+
+## Ekran Paylasimi Kalitesi
+
+Ekran paylasimi menusunden **720p / 1080p** ve **30 / 60 FPS** secilebilir. Varsayilan 1080p 30 FPS'tir; secimler cihazda saklanir.
+
+| Hedef kalite | Video bitrate ust siniri (karsi taraf basina) |
+| --- | --- |
+| 720p 30 FPS | 3 Mbps |
+| 720p 60 FPS | 5 Mbps |
+| 1080p 30 FPS | 6 Mbps |
+| 1080p 60 FPS | 10 Mbps |
+
+30 FPS profilleri metin ve detay netligini korumaya, 60 FPS profilleri netlik ve akiciligi dengelemeye oncelik verir. Paylasim sesi icin ust sinir 128 kbps'tir. Bunlar hedef ve ust sinirlardir; WebRTC baglantiya ve donanima gore kaliteyi ayarlar. Paylasim durumunda kaynak goruntunun gercek boyutlari ve FPS ayari gosterilir; bu etiket aliciya ulasan kalite olcumu degildir. Kalite ayarlari uygulanamazsa kullanici bilgilendirilir.
+
+## Mikrofon Gurultu Engelleme
+
+**Audio settings > Noise suppression** alaninda uc mod bulunur:
+
+- **Off**: gurultu engelleme kapali.
+- **Standard**: WebRTC'nin yerlesik gurultu filtresi.
+- **RNNoise (AI)**: 48 kHz mono ses uzerinde, cihazda calisan WASM/AudioWorklet filtresi. Varsayilan moddur; eski ayarlarda gurultu engelleme kapaliysa Off korunur.
+
+RNNoise modeli ve islemci dosyasi uygulamayla paketlenir; harici servis veya API anahtari gerekmez. RNNoise seciliyken yerlesik gurultu filtresi kapatilir. Filtre yuklenemezse veya islemci hata verirse standart moda gecilmeye calisilir ve ayarlarda bilgi gosterilir. Yanki engelleme ve otomatik ses seviyesi bagimsiz ayarlardir.
+
+Dagitima dahil edilen lisanslar: [frontend/public/third-party-licenses](frontend/public/third-party-licenses).
 
 ## Kontroller
 
@@ -125,7 +154,14 @@ go build ./...
 ```powershell
 cd frontend
 cmd /c npm run build
+cmd /c npm run test:audio
+cmd /c npm run test:screen
+cmd /c npm run test:ui
 ```
+
+Ekran testleri sentetik goruntu ve sesle kalite secimini, gercek WebRTC gonderici parametrelerini, iptal/hata durumlarini ve ikinci bir yerel peer'de 1080p goruntunun alinmasini dogrular; kullanicinin ekranini yakalamaz.
+
+Ses testleri kurulu Chrome/Edge ile sentetik ses kullanir; fiziksel mikrofonu acmaz. Farkli bir Chromium kurulumu icin `MIKCORT_TEST_BROWSER` ortam degiskenini tarayicinin calistirilabilir dosyasina ayarla. Testler uretim CSP'si altinda gercek RNNoise WASM islemesini, hata durumlarini, mod degisimini ve mikrofon kaynaklarinin kapanmasini dogrular.
 
 ```powershell
 cd backend/cloudflare-signaling

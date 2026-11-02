@@ -1,5 +1,7 @@
 import { ref, type ComputedRef, type Ref } from 'vue';
 import { usePersistentBoolean, usePersistentNumber, usePersistentString } from '../../composables/usePersistentStorage';
+import { readStoredBoolean } from '../../shared/storage';
+import { createMicrophonePipeline, normalizeNoiseSuppressionMode, type MicrophonePipeline } from './microphoneProcessing';
 
 type VoiceFeedback =
   | 'mute'
@@ -12,7 +14,7 @@ type VoiceFeedback =
   | 'user-leave';
 
 interface UseVoiceAudioOptions {
-  configureSender: (sender: RTCRtpSender, track: MediaStreamTrack, source: 'mic' | 'screen') => void;
+  configureSender: (sender: RTCRtpSender, track: MediaStreamTrack, source: 'mic' | 'screen') => void | Promise<void>;
   currentUserId: Ref<string>;
   ensurePeer: (userId: string, makeOffer: boolean) => Promise<RTCPeerConnection>;
   error: Ref<string>;
@@ -60,7 +62,10 @@ export function useVoiceAudio({
   const inputGain = usePersistentNumber('mikcort:audio:input-gain', 100, 0, 100);
   const inputSensitivity = usePersistentNumber('mikcort:audio:input-sensitivity', 2, 0, 10);
   const outputVolume = usePersistentNumber('mikcort:audio:output-volume', 100, 0, 100);
-  const noiseSuppression = usePersistentBoolean('mikcort:audio:noise-suppression', true);
+  const noiseSuppressionMode = usePersistentString('mikcort:audio:noise-suppression-mode',
+    readStoredBoolean('mikcort:audio:noise-suppression', true) ? 'rnnoise' : 'off');
+  noiseSuppressionMode.value = normalizeNoiseSuppressionMode(noiseSuppressionMode.value);
+  const noiseSuppressionNotice = ref('');
   const echoCancellation = usePersistentBoolean('mikcort:audio:echo-cancellation', true);
   const autoGainControl = usePersistentBoolean('mikcort:audio:auto-gain-control', true);
 
@@ -70,6 +75,8 @@ export function useVoiceAudio({
   let micSensitivityNode: GainNode | null = null;
   let micSensitivityAnalyser: AnalyserNode | null = null;
   let micSensitivityTimer: number | undefined;
+  let microphonePipeline: MicrophonePipeline | null = null;
+  let microphoneRequest: AbortController | null = null;
 
   async function startMicrophone() {
     if (micStarted.value || micStarting.value) {
@@ -78,19 +85,24 @@ export function useVoiceAudio({
     micStarting.value = true;
     try {
       error.value = '';
-      await openMicrophone();
+      if (!await openMicrophone()) {
+        return;
+      }
       if (localStream.value) {
         startSpeakingDetection(currentUserId.value, localStream.value);
       }
-      muted.value = false;
       micStarted.value = true;
       status.value = 'Microphone is on.';
+
+      await replaceMicrophoneTracks();
 
       for (const userId of otherUsers.value) {
         await ensurePeer(userId, true);
       }
     } catch (err) {
-      error.value = err instanceof Error ? err.message : 'Microphone permission failed.';
+      if (!(err instanceof DOMException && err.name === 'AbortError')) {
+        error.value = err instanceof Error ? err.message : 'Microphone permission failed.';
+      }
     } finally {
       micStarting.value = false;
     }
@@ -115,28 +127,46 @@ export function useVoiceAudio({
   async function applyAudioSettings() {
     updateMicGain();
     updateRemoteAudioSettings();
-    if (micStarted.value) {
-      await restartMicrophone();
+    if (micStarted.value && !micStarting.value) {
+      micStarting.value = true;
+      try {
+        await restartMicrophone();
+      } catch (err) {
+        if (!(err instanceof DOMException && err.name === 'AbortError')) {
+          micStarted.value = false;
+          error.value = err instanceof Error ? err.message : 'Could not update microphone settings.';
+        }
+      } finally {
+        micStarting.value = false;
+      }
     }
   }
 
   async function restartMicrophone() {
-    const wasMuted = muted.value;
     stopLocalAudio();
-    await openMicrophone();
+    if (!await openMicrophone()) {
+      return;
+    }
     if (localStream.value) {
       startSpeakingDetection(currentUserId.value, localStream.value);
     }
-    muted.value = wasMuted;
-    setLocalTracksEnabled(!wasMuted);
+    setLocalTracksEnabled(!muted.value && !deafened.value);
 
+    await replaceMicrophoneTracks();
+  }
+
+  async function replaceMicrophoneTracks() {
+    const stream = localStream.value;
+    const nextTrack = stream?.getAudioTracks()[0] ?? null;
     for (const peer of peers.values()) {
-      const nextTrack = localStream.value?.getAudioTracks()[0] ?? null;
       for (const sender of peer.getSenders()) {
+        if (localStream.value !== stream) {
+          return;
+        }
         if (senderSources.get(sender) === 'mic') {
           await sender.replaceTrack(nextTrack);
-          if (nextTrack) {
-            configureSender(sender, nextTrack, 'mic');
+          if (nextTrack && localStream.value === stream) {
+            await configureSender(sender, nextTrack, 'mic');
           }
         }
       }
@@ -144,36 +174,38 @@ export function useVoiceAudio({
   }
 
   async function openMicrophone() {
-    rawLocalStream.value = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        deviceId: selectedInputId.value ? { exact: selectedInputId.value } : undefined,
-        noiseSuppression: noiseSuppression.value,
-        echoCancellation: echoCancellation.value,
-        autoGainControl: autoGainControl.value,
+    microphoneRequest?.abort();
+    const request = new AbortController();
+    microphoneRequest = request;
+    noiseSuppressionNotice.value = '';
+    const pipeline = await createMicrophonePipeline({
+      deviceId: selectedInputId.value,
+      noiseSuppression: normalizeNoiseSuppressionMode(noiseSuppressionMode.value),
+      echoCancellation: echoCancellation.value,
+      autoGainControl: autoGainControl.value,
+      signal: request.signal,
+      onNotice: (message) => {
+        if (microphoneRequest === request) {
+          noiseSuppressionNotice.value = message;
+        }
       },
     });
-    localStream.value = buildProcessedMicrophoneStream(rawLocalStream.value);
+    if (request.signal.aborted || microphoneRequest !== request) {
+      pipeline.destroy();
+      return false;
+    }
+    microphonePipeline = pipeline;
+    rawLocalStream.value = pipeline.rawStream;
+    localStream.value = pipeline.stream;
+    audioContext = pipeline.context;
+    micGainNode = pipeline.gain;
+    micSensitivityNode = pipeline.sensitivityGain;
+    micSensitivityAnalyser = pipeline.analyser;
+    setLocalTracksEnabled(!muted.value && !deafened.value);
     updateMicGain();
-    await loadDevices();
-  }
-
-  function buildProcessedMicrophoneStream(stream: MediaStream) {
-    audioContext = new AudioContext();
-    const source = audioContext.createMediaStreamSource(stream);
-    micSensitivityNode = audioContext.createGain();
-    micSensitivityAnalyser = audioContext.createAnalyser();
-    micGainNode = audioContext.createGain();
-    const destination = audioContext.createMediaStreamDestination();
-
-    micSensitivityAnalyser.fftSize = 1024;
-    micSensitivityNode.gain.value = 1;
-
-    source.connect(micSensitivityAnalyser);
-    source.connect(micSensitivityNode);
-    micSensitivityNode.connect(micGainNode);
-    micGainNode.connect(destination);
     startInputSensitivityMonitor();
-    return destination.stream;
+    void loadDevices().catch(() => {});
+    return true;
   }
 
   function updateMicGain() {
@@ -334,6 +366,10 @@ export function useVoiceAudio({
   }
 
   function stopLocalAudio() {
+    microphoneRequest?.abort();
+    microphoneRequest = null;
+    microphonePipeline?.destroy();
+    microphonePipeline = null;
     stopSpeakingDetection(currentUserId.value);
     rawLocalStream.value?.getTracks().forEach((track) => track.stop());
     localStream.value?.getTracks().forEach((track) => track.stop());
@@ -343,7 +379,6 @@ export function useVoiceAudio({
     micGainNode = null;
     micSensitivityNode = null;
     micSensitivityAnalyser = null;
-    void audioContext?.close();
     audioContext = null;
     void feedbackAudioContext?.close();
     feedbackAudioContext = null;
@@ -370,7 +405,8 @@ export function useVoiceAudio({
     micStarted,
     micStarting,
     muted,
-    noiseSuppression,
+    noiseSuppressionMode,
+    noiseSuppressionNotice,
     outputDevices,
     outputVolume,
     playVoiceFeedback,

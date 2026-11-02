@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Send } from 'lucide-vue-next';
+import { MessageSquare, Send, X } from 'lucide-vue-next';
 import type { ComponentPublicInstance } from 'vue';
 import { normalizedChatText, chatTime } from '../../features/voice/chat';
 import type { ChatMessage } from '../../features/voice/types';
@@ -16,6 +16,7 @@ defineProps<{
 
 defineEmits<{
   send: [];
+  close: [];
 }>();
 </script>
 
@@ -23,10 +24,10 @@ defineEmits<{
   <section class="room-chat" aria-label="Room chat" @click.stop>
     <div class="chat-header">
       <h2>Chat</h2>
-      <span>{{ messages.length }}</span>
+      <button type="button" class="icon-button quiet-button compact-button" aria-label="Close chat" @click="$emit('close')"><X :size="17" /></button>
     </div>
     <div :ref="setLogElement" class="chat-messages">
-      <div v-if="!messages.length" class="chat-empty">No messages yet.</div>
+      <div v-if="!messages.length" class="chat-empty"><MessageSquare :size="25" /><strong>A little side conversation.</strong><span>Messages stay in this room.</span></div>
       <article
         v-for="message in messages"
         :key="message.id"
@@ -40,7 +41,7 @@ defineEmits<{
       </article>
     </div>
     <form class="chat-form" @submit.prevent="$emit('send')">
-      <input v-model="draft" maxlength="500" autocomplete="off" placeholder="Message room" />
+      <input v-model="draft" aria-label="Message room" maxlength="500" autocomplete="off" placeholder="Say something…" />
       <button
         type="submit"
         class="icon-button compact-button"

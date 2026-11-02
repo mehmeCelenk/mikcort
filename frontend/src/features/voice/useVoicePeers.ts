@@ -1,16 +1,18 @@
 import type { ComputedRef, Ref } from 'vue';
 import type { SenderSource, SignalMessage } from './types';
+import type { ScreenShareProfile } from './screenShareQuality';
 
 interface UseVoicePeersOptions {
   attachRemoteScreen: (userId: string, stream: MediaStream) => void;
   currentUserId: Ref<string>;
+  error: Ref<string>;
   getLocalStream: () => MediaStream | null;
   getRemoteElementVolume: (audio: HTMLAudioElement) => number;
   getScreenStream: () => MediaStream | null;
   getSocketOpen: () => boolean;
   getUsers: () => string[];
   intentionallyClosed: () => boolean;
-  normalizedScreenFps: () => number;
+  getScreenShareProfile: () => ScreenShareProfile;
   otherUsers: ComputedRef<string[]>;
   peerStates: Record<string, string>;
   remoteAudio: Ref<HTMLDivElement | null>;
@@ -29,13 +31,14 @@ interface UseVoicePeersOptions {
 export function useVoicePeers({
   attachRemoteScreen,
   currentUserId,
+  error,
   getLocalStream,
   getRemoteElementVolume,
   getScreenStream,
   getSocketOpen,
   getUsers,
   intentionallyClosed,
-  normalizedScreenFps,
+  getScreenShareProfile,
   peerStates,
   remoteAudio,
   removeRemoteScreen,
@@ -77,7 +80,7 @@ export function useVoicePeers({
     if (localStream) {
       for (const track of localStream.getAudioTracks()) {
         if (!peer.getSenders().some((sender) => senderSources.get(sender) === 'mic')) {
-          addSender(peer, track, localStream, 'mic');
+          await addSender(peer, track, localStream, 'mic');
         }
       }
     }
@@ -85,8 +88,12 @@ export function useVoicePeers({
     const screenStream = getScreenStream();
     if (screenStream) {
       for (const track of screenStream.getTracks()) {
+        // Applying sender parameters yields; sharing may stop before the next track.
+        if (getScreenStream() !== screenStream || track.readyState !== 'live' || peer.signalingState === 'closed') {
+          break;
+        }
         if (!peer.getSenders().some((sender) => sender.track === track)) {
-          addSender(peer, track, screenStream, 'screen');
+          await addSender(peer, track, screenStream, 'screen');
         }
       }
     }
@@ -565,32 +572,43 @@ export function useVoicePeers({
     tryPlay();
   }
 
-  function addSender(peer: RTCPeerConnection, track: MediaStreamTrack, stream: MediaStream, source: SenderSource) {
+  async function addSender(peer: RTCPeerConnection, track: MediaStreamTrack, stream: MediaStream, source: SenderSource) {
     const sender = peer.addTrack(track, stream);
     senderSources.set(sender, source);
-    configureSender(sender, track, source);
+    await configureSender(sender, track, source);
     return sender;
   }
 
-  function configureSender(sender: RTCRtpSender, track: MediaStreamTrack, source: SenderSource) {
+  async function configureSender(sender: RTCRtpSender, track: MediaStreamTrack, source: SenderSource) {
+    if (source !== 'screen') {
+      return;
+    }
     const parameters = sender.getParameters();
     parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
 
     if (track.kind === 'video') {
-      parameters.degradationPreference = 'maintain-framerate';
+      const profile = getScreenShareProfile();
+      parameters.degradationPreference = profile.degradationPreference;
       parameters.encodings[0] = {
         ...parameters.encodings[0],
-        maxBitrate: 1_500_000,
-        maxFramerate: normalizedScreenFps(),
+        maxBitrate: profile.maxBitrate,
+        maxFramerate: profile.fps,
+        scaleResolutionDownBy: 1,
       };
     } else if (track.kind === 'audio' && source === 'screen') {
       parameters.encodings[0] = {
         ...parameters.encodings[0],
-        maxBitrate: 64_000,
+        maxBitrate: 128_000,
       };
     }
 
-    void sender.setParameters(parameters).catch(() => undefined);
+    try {
+      await sender.setParameters(parameters);
+    } catch {
+      if (track.readyState === 'live' && !intentionallyClosed()) {
+        error.value = 'Screen sharing is active, but the selected streaming quality could not be applied.';
+      }
+    }
   }
 
   function closePeer(userId: string) {
