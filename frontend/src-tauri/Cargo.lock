@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "mikcort"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "serde_json",
  "tauri",

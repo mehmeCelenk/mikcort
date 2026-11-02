@@ -1,6 +1,10 @@
 import type { ComputedRef, Ref } from 'vue';
 import type { SenderSource, SignalMessage } from './types';
 import type { ScreenShareProfile } from './screenShareQuality';
+import { connectionErrorDetails, peerDiagnosticId, recordConnectionEvent } from './connectionDiagnostics';
+
+type PeerDescription = RTCSessionDescriptionInit & { sessionId?: string; offerId?: string };
+type PeerCandidate = RTCIceCandidateInit & { sessionId?: string };
 
 interface UseVoicePeersOptions {
   attachRemoteScreen: (userId: string, stream: MediaStream) => void;
@@ -53,7 +57,12 @@ export function useVoicePeers({
   screenVolumes,
 }: UseVoicePeersOptions) {
   const peers = new Map<string, RTCPeerConnection>();
-  const queuedCandidates = new Map<string, RTCIceCandidateInit[]>();
+  const queuedCandidates = new Map<string, PeerCandidate[]>();
+  const sessions = new WeakMap<RTCPeerConnection, string>();
+  const outstandingOffers = new WeakMap<RTCPeerConnection, string>();
+  const retiredSessions = new Map<string, Set<string>>();
+  const operations = new Map<string, Promise<unknown>>();
+  const monitors = new Map<string, number>();
   const senderSources = new WeakMap<RTCRtpSender, SenderSource>();
   const makingOffers = new Set<string>();
   const peerRecoveryTimers = new Map<string, number>();
@@ -65,6 +74,33 @@ export function useVoicePeers({
   const queuedScreenShareOfferTimers = new Map<string, number>();
   const ignoredOfferUsers = new Set<string>();
 
+  function diagnostic(userId: string, event: string, details: Record<string, unknown> = {}) {
+    const peer = peers.get(userId);
+    recordConnectionEvent(event, { peer: peerDiagnosticId(userId), session: peer ? sessions.get(peer) : undefined, connection: peer?.connectionState,
+      ice: peer?.iceConnectionState, signaling: peer?.signalingState, ...details });
+  }
+
+  function isCurrent(userId: string, peer: RTCPeerConnection) {
+    return !intentionallyClosed() && peers.get(userId) === peer && peer.signalingState !== 'closed';
+  }
+
+  // SDP and ICE operations must not overlap with an offer/answer or rollback.
+  function serialize<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+    const next = (operations.get(userId) ?? Promise.resolve()).catch(() => {}).then(operation);
+    operations.set(userId, next);
+    void next.finally(() => {
+      if (operations.get(userId) === next) operations.delete(userId);
+    }).catch(() => {});
+    return next;
+  }
+
+  function retireSession(userId: string, sessionId: string) {
+    const retired = retiredSessions.get(userId) ?? new Set<string>();
+    retired.add(sessionId);
+    if (retired.size > 32) retired.delete(retired.values().next().value!);
+    retiredSessions.set(userId, retired);
+  }
+
   async function ensurePeer(userId: string, makeOffer: boolean) {
     let peer = peers.get(userId);
     if (peer?.signalingState === 'closed' || peer?.connectionState === 'closed') {
@@ -74,6 +110,7 @@ export function useVoicePeers({
     if (!peer) {
       peer = createPeer(userId);
       peers.set(userId, peer);
+      startPeerMonitor(userId, peer);
     }
 
     const localStream = getLocalStream();
@@ -106,8 +143,8 @@ export function useVoicePeers({
   }
 
   async function requestPeerOffer(userId: string, peer: RTCPeerConnection, options?: RTCOfferOptions) {
-    const offerSent = await sendOffer(userId, peer, options);
-    if (!offerSent && peer.signalingState !== 'closed') {
+    const offerSent = await serialize(userId, () => sendOffer(userId, peer, options));
+    if (!offerSent && isCurrent(userId, peer)) {
       pendingOffers.set(userId, mergeOfferOptions(pendingOffers.get(userId), options));
     }
     return offerSent;
@@ -151,17 +188,30 @@ export function useVoicePeers({
     await requestPeerOffer(userId, currentPeer);
   }
 
-  async function receiveAnswer(userId: string, answer: RTCSessionDescriptionInit) {
+  async function receiveAnswer(userId: string, answer: PeerDescription) {
+    await serialize(userId, async () => {
+      const peer = peers.get(userId);
+      if (!peer || !isCurrent(userId, peer) || peer.signalingState !== 'have-local-offer') return;
+      if ((answer.sessionId && answer.sessionId !== sessions.get(peer)) ||
+          (answer.offerId && answer.offerId !== outstandingOffers.get(peer))) {
+        diagnostic(userId, 'stale-answer');
+        return;
+      }
+      try {
+        await peer.setRemoteDescription(answer);
+        if (!isCurrent(userId, peer)) return;
+        outstandingOffers.delete(peer);
+        ignoredOfferUsers.delete(userId);
+        diagnostic(userId, 'answer-received');
+        await flushQueuedCandidates(userId, peer);
+      } catch (cause) { signalFailure(userId, peer, 'answer-error', cause); }
+    });
     const peer = peers.get(userId);
-    if (peer && peer.signalingState === 'have-local-offer') {
-      await peer.setRemoteDescription(answer).catch(() => undefined);
-      await flushQueuedCandidates(userId, peer);
-      await flushPendingOffer(userId, peer);
-    }
+    if (peer) await flushPendingOffer(userId, peer);
   }
 
   async function flushPendingOffer(userId: string, peer: RTCPeerConnection) {
-    if (peer.signalingState !== 'stable' || !getSocketOpen() || !pendingOffers.has(userId)) {
+    if (!isCurrent(userId, peer) || peer.signalingState !== 'stable' || !getSocketOpen() || !pendingOffers.has(userId)) {
       return;
     }
 
@@ -185,27 +235,32 @@ export function useVoicePeers({
   }
 
   async function sendOffer(userId: string, peer: RTCPeerConnection, options?: RTCOfferOptions) {
-    if (makingOffers.has(userId) || peer.signalingState !== 'stable') {
+    if (!isCurrent(userId, peer) || !getSocketOpen() || makingOffers.has(userId) || peer.signalingState !== 'stable') {
       return false;
     }
 
     makingOffers.add(userId);
     try {
       const offer = await peer.createOffer(options);
-      if (peer.signalingState !== 'stable') {
+      if (!isCurrent(userId, peer) || peer.signalingState !== 'stable' || !getSocketOpen()) {
         return false;
       }
 
       await peer.setLocalDescription(offer);
+      if (!isCurrent(userId, peer)) return false;
+      const offerId = crypto.randomUUID();
+      outstandingOffers.set(peer, offerId);
       sendSignal({
         type: 'offer',
         roomId: roomId(),
         userId: currentUserId.value,
         targetUserId: userId,
-        payload: offer,
+        payload: { ...offer, sessionId: sessions.get(peer), offerId },
       });
+      diagnostic(userId, 'offer-sent', { iceRestart: !!options?.iceRestart });
       return true;
-    } catch {
+    } catch (cause) {
+      signalFailure(userId, peer, 'offer-error', cause);
       return false;
     } finally {
       makingOffers.delete(userId);
@@ -220,35 +275,39 @@ export function useVoicePeers({
       ],
       iceCandidatePoolSize: 4,
     });
+    sessions.set(peer, crypto.randomUUID());
 
-    setupPeerHeartbeat(userId, peer.createDataChannel('heartbeat', { ordered: false, maxRetransmits: 0 }));
+    // Either endpoint may send the initial offer, so both need an SCTP section.
+    // Every channel answers pings; only one drives the local watchdog.
+    setupPeerHeartbeat(userId, peer, peer.createDataChannel('heartbeat', { ordered: false, maxRetransmits: 0 }));
     peer.ondatachannel = (event) => {
-      if (event.channel.label === 'heartbeat') {
-        setupPeerHeartbeat(userId, event.channel);
+      if (isCurrent(userId, peer) && event.channel.label === 'heartbeat') {
+        setupPeerHeartbeat(userId, peer, event.channel);
       }
     };
 
     peerStates[userId] = 'new';
 
     peer.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (event.candidate && isCurrent(userId, peer)) {
         sendSignal({
           type: 'ice-candidate',
           roomId: roomId(),
           userId: currentUserId.value,
           targetUserId: userId,
-          payload: event.candidate.toJSON(),
+          payload: { ...event.candidate.toJSON(), sessionId: sessions.get(peer) },
         });
       }
     };
 
     peer.onconnectionstatechange = () => handlePeerConnectionState(userId, peer);
     peer.oniceconnectionstatechange = () => handlePeerConnectionState(userId, peer);
-    peer.onsignalingstatechange = () => {
-      void flushPendingOffer(userId, peer);
+    peer.onicecandidateerror = (event) => {
+      if (isCurrent(userId, peer)) diagnostic(userId, 'ice-candidate-error', { code: event.errorCode });
     };
 
     peer.ontrack = (event) => {
+      if (!isCurrent(userId, peer)) return;
       const stream = event.streams[0] ?? new MediaStream([event.track]);
       if (event.track.kind === 'audio') {
         const source = stream.getVideoTracks().length ? 'screen' : 'mic';
@@ -262,10 +321,14 @@ export function useVoicePeers({
   }
 
   function handlePeerConnectionState(userId: string, peer: RTCPeerConnection) {
-    const state = peer.connectionState === 'new' ? peer.iceConnectionState : peer.connectionState;
+    if (!isCurrent(userId, peer)) return;
+    const state = [peer.connectionState, peer.iceConnectionState].includes('failed') ? 'failed'
+      : [peer.connectionState, peer.iceConnectionState].includes('disconnected') ? 'disconnected'
+      : peer.connectionState === 'new' ? peer.iceConnectionState : peer.connectionState;
     peerStates[userId] = state;
+    diagnostic(userId, 'peer-state');
 
-    if (isPeerHealthy(peer)) {
+    if (isPeerHealthy(peer) && !microphoneTrackStalled(userId)) {
       clearPeerRecovery(userId);
       peerRecoveryAttempts.delete(userId);
       if (status.value === 'Reconnecting voice...') {
@@ -279,8 +342,8 @@ export function useVoicePeers({
     }
   }
 
-  function schedulePeerRecovery(userId: string, peer: RTCPeerConnection, delay: number) {
-    if (intentionallyClosed() || peerRecoveryTimers.has(userId)) {
+  function schedulePeerRecovery(userId: string, peer: RTCPeerConnection, delay: number, force = false) {
+    if (!isCurrent(userId, peer) || peerRecoveryTimers.has(userId)) {
       return;
     }
 
@@ -289,36 +352,47 @@ export function useVoicePeers({
     }
     const timer = window.setTimeout(() => {
       peerRecoveryTimers.delete(userId);
-      if (intentionallyClosed() || peer.connectionState === 'closed') {
+      if (!isCurrent(userId, peer)) {
         return;
       }
-      if (isPeerHealthy(peer)) {
+      if (!force && isPeerHealthy(peer)) {
         return;
       }
       status.value = 'Reconnecting voice...';
-      void recoverPeer(userId, peer);
+      void serialize(userId, () => recoverPeer(userId, peer)).catch((cause) => {
+        signalFailure(userId, peer, 'recovery-error', cause);
+      });
     }, delay);
     peerRecoveryTimers.set(userId, timer);
   }
 
   async function recoverPeer(userId: string, peer: RTCPeerConnection) {
+    if (!isCurrent(userId, peer) || !getUsers().includes(userId)) return;
+    // Waiting for signaling is not a failed recovery attempt.
+    if (!getSocketOpen()) {
+      diagnostic(userId, 'recovery-waiting-for-signaling');
+      schedulePeerRecovery(userId, peer, 3000, true);
+      return;
+    }
     const attempts = (peerRecoveryAttempts.get(userId) ?? 0) + 1;
     peerRecoveryAttempts.set(userId, attempts);
+    diagnostic(userId, 'recovery-start', { attempts });
 
-    if (attempts >= 2) {
+    if (attempts >= 3 || peer.signalingState === 'have-remote-offer') {
       await rebuildPeer(userId);
       return;
     }
 
-    if (!getSocketOpen() || peer.signalingState !== 'stable') {
-      schedulePeerRecovery(userId, peer, 3000);
-      return;
+    if (peer.signalingState === 'have-local-offer') {
+      // A lost answer must not leave the peer permanently waiting for it.
+      await peer.setLocalDescription({ type: 'rollback' });
     }
-
-    await requestPeerOffer(userId, peer, { iceRestart: true });
+    if (!isCurrent(userId, peer)) return;
+    peer.restartIce();
+    await sendOffer(userId, peer, { iceRestart: true });
 
     if (!isPeerHealthy(peer)) {
-      schedulePeerRecovery(userId, peer, 5000);
+      schedulePeerRecovery(userId, peer, 15_000);
     }
   }
 
@@ -327,25 +401,108 @@ export function useVoicePeers({
       return;
     }
 
-    closePeer(userId);
-    peerRecoveryAttempts.delete(userId);
+    diagnostic(userId, 'peer-rebuild');
+    closePeer(userId, true);
     status.value = 'Reconnecting voice...';
-    await ensurePeer(userId, shouldInitiatePeerRecovery(userId));
-  }
-
-  function shouldInitiatePeerRecovery(userId: string) {
-    return currentUserId.value.localeCompare(userId) > 0;
+    // Either endpoint can initiate. The session ID tells the other endpoint to
+    // replace its transport too; polite/impolite roles resolve simultaneous offers.
+    const peer = await ensurePeer(userId, false);
+    await sendOffer(userId, peer);
+    schedulePeerRecovery(userId, peer, 20_000);
   }
 
   function isPolitePeer(userId: string) {
-    return currentUserId.value.localeCompare(userId) > 0;
+    return currentUserId.value > userId;
   }
 
   function isPeerHealthy(peer: RTCPeerConnection) {
-    return peer.connectionState === 'connected' || peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed';
+    return peer.connectionState === 'connected' && (peer.iceConnectionState === 'connected' || peer.iceConnectionState === 'completed');
   }
 
-  function setupPeerHeartbeat(userId: string, channel: RTCDataChannel) {
+  function microphoneTrackStalled(userId: string) {
+    const audio = remoteAudio.value?.querySelector(`[data-user-id="${userId}"][data-source="mic"]`) as HTMLAudioElement | null;
+    const stream = audio?.srcObject as MediaStream | null;
+    return stream?.getAudioTracks().some((track) => track.muted || track.readyState === 'ended') ?? false;
+  }
+
+  function signalFailure(userId: string, peer: RTCPeerConnection, event: string, cause: unknown) {
+    if (!isCurrent(userId, peer)) return;
+    diagnostic(userId, event, connectionErrorDetails(cause));
+    schedulePeerRecovery(userId, peer, 3000, true);
+  }
+
+  function startPeerMonitor(userId: string, peer: RTCPeerConnection) {
+    let lastProgress = performance.now();
+    let lastSignalingState = peer.signalingState;
+    let signalingSince = lastProgress;
+    let sampling = false;
+    let sampleCount = 0;
+    let previousPackets = -1;
+    let stalledSince = lastProgress;
+    let mutedSince = lastProgress;
+    const timer = window.setInterval(async () => {
+      if (!isCurrent(userId, peer) || sampling) return;
+      const now = performance.now();
+      if (peer.signalingState !== lastSignalingState) {
+        lastSignalingState = peer.signalingState;
+        signalingSince = now;
+      }
+      if (isPeerHealthy(peer)) lastProgress = now;
+      if (!microphoneTrackStalled(userId)) mutedSince = now;
+      else if (now - mutedSince > 15_000) {
+        diagnostic(userId, 'microphone-track-stalled');
+        schedulePeerRecovery(userId, peer, 0, true);
+        mutedSince = now;
+      }
+      if (now - lastProgress > 20_000 || (peer.signalingState !== 'stable' && now - signalingSince > 20_000)) {
+        diagnostic(userId, 'connection-timeout');
+        schedulePeerRecovery(userId, peer, 0, true);
+        lastProgress = signalingSince = now;
+      }
+      if (getSocketOpen() && peer.signalingState === 'stable' && pendingOffers.has(userId)) {
+        void flushPendingOffer(userId, peer);
+      }
+      sampling = true;
+      try {
+        const stats = await peer.getStats();
+        if (!isCurrent(userId, peer)) return;
+        const audio: Record<string, unknown>[] = [];
+        let packets = 0;
+        let hasInbound = false;
+        let selectedPair: Record<string, unknown> | undefined;
+        stats.forEach((report) => {
+          if ((report.type === 'inbound-rtp' || report.type === 'outbound-rtp') && report.kind === 'audio') {
+            audio.push({ direction: report.type, packetsReceived: report.packetsReceived, packetsSent: report.packetsSent,
+              packetsLost: report.packetsLost, bytesReceived: report.bytesReceived, bytesSent: report.bytesSent, jitter: report.jitter });
+            if (report.type === 'inbound-rtp') { hasInbound = true; packets += report.packetsReceived ?? 0; }
+          }
+          if (report.type === 'transport' && report.selectedCandidatePairId) {
+            const pair = stats.get(report.selectedCandidatePairId);
+            if (pair) selectedPair = { state: pair.state, rtt: pair.currentRoundTripTime,
+              bytesSent: pair.bytesSent, bytesReceived: pair.bytesReceived,
+              localType: stats.get(pair.localCandidateId)?.candidateType,
+              remoteType: stats.get(pair.remoteCandidateId)?.candidateType,
+              protocol: stats.get(pair.localCandidateId)?.protocol };
+          }
+        });
+        if (packets !== previousPackets) { previousPackets = packets; stalledSince = now; }
+        // Packet silence alone can be DTX/mute. Log it, but don't tear down a
+        // working call without a transport/track/heartbeat failure as well.
+        if (++sampleCount % 2 === 0) diagnostic(userId, 'peer-stats', {
+          audio, selectedPair, inboundStalledMs: hasInbound ? Math.round(now - stalledSince) : undefined,
+          tracks: peer.getReceivers().map(({ track }) => ({ kind: track.kind, muted: track.muted, state: track.readyState })),
+          senders: peer.getSenders().map(({ track }) => ({ kind: track?.kind, enabled: track?.enabled, state: track?.readyState })),
+          playback: Array.from(remoteAudio.value?.querySelectorAll<HTMLAudioElement>(`[data-user-id="${userId}"]`) ?? [])
+            .map((element) => ({ source: element.dataset.source, paused: element.paused, muted: element.muted,
+              volume: element.volume, readyState: element.readyState })),
+        });
+      } catch (cause) { diagnostic(userId, 'stats-error', connectionErrorDetails(cause)); }
+      finally { sampling = false; }
+    }, 5000);
+    monitors.set(userId, timer);
+  }
+
+  function setupPeerHeartbeat(userId: string, peer: RTCPeerConnection, channel: RTCDataChannel) {
     const existing = peerHeartbeats.get(userId);
     if (existing?.channel === channel) {
       return;
@@ -353,11 +510,24 @@ export function useVoicePeers({
     clearPeerHeartbeat(userId);
 
     peerHeartbeats.set(userId, { channel, lastSeen: performance.now() });
-    channel.addEventListener('message', (event) => handlePeerHeartbeatMessage(userId, channel, event));
+    channel.addEventListener('message', (event) => {
+      if (!isCurrent(userId, peer)) return;
+      // Respond on every incoming channel, including one from an older client
+      // which also created a channel. Only one channel drives our watchdog.
+      if (event.data === 'ping' && channel.readyState === 'open') {
+        try { channel.send('pong'); } catch (cause) { diagnostic(userId, 'heartbeat-send-error', connectionErrorDetails(cause)); }
+      }
+      if (peerHeartbeats.get(userId)?.channel === channel) handlePeerHeartbeatMessage(userId, channel, event);
+    });
     channel.addEventListener('open', () => startPeerHeartbeat(userId, channel));
     channel.addEventListener('close', () => {
       if (peerHeartbeats.get(userId)?.channel === channel) {
         clearPeerHeartbeat(userId);
+        if (isCurrent(userId, peer)) {
+          diagnostic(userId, 'heartbeat-closed');
+          peerRecoveryAttempts.set(userId, 2);
+          schedulePeerRecovery(userId, peer, 10_000, true);
+        }
       }
     });
 
@@ -378,11 +548,13 @@ export function useVoicePeers({
         return;
       }
       const staleFor = performance.now() - heartbeat.lastSeen;
-      if (staleFor > 120_000) {
-        clearPeerHeartbeat(userId);
-        return;
+      if (staleFor > 40_000) {
+        diagnostic(userId, 'heartbeat-timeout', { staleFor: Math.round(staleFor) });
+        const peer = peers.get(userId);
+        if (peer) schedulePeerRecovery(userId, peer, 0, true);
+        heartbeat.lastSeen = performance.now();
       }
-      channel.send('ping');
+      try { channel.send('ping'); } catch (cause) { diagnostic(userId, 'heartbeat-send-error', connectionErrorDetails(cause)); }
     }, 10_000);
   }
 
@@ -392,10 +564,7 @@ export function useVoicePeers({
       return;
     }
 
-    heartbeat.lastSeen = performance.now();
-    if (event.data === 'ping' && channel.readyState === 'open') {
-      channel.send('pong');
-    }
+    if (event.data === 'ping' || event.data === 'pong') heartbeat.lastSeen = performance.now();
   }
 
   function clearPeerHeartbeat(userId: string) {
@@ -419,6 +588,8 @@ export function useVoicePeers({
   }
 
   function scheduleRemoteTrackRecovery(userId: string, source: 'mic' | 'screen') {
+    const peer = peers.get(userId);
+    if (!peer) return;
     const key = remoteTrackRecoveryKey(userId, source);
     if (remoteTrackRecoveryTimers.has(key)) {
       return;
@@ -426,9 +597,10 @@ export function useVoicePeers({
 
     const timer = window.setTimeout(() => {
       remoteTrackRecoveryTimers.delete(key);
-      const peer = peers.get(userId);
-      if (peer && !intentionallyClosed()) {
-        schedulePeerRecovery(userId, peer, 0);
+      if (isCurrent(userId, peer)) {
+        diagnostic(userId, 'remote-track-timeout', { source });
+        // Stopping screen sharing can intentionally mute its remote track.
+        if (source === 'mic') schedulePeerRecovery(userId, peer, 0, true);
       }
     }, 8_000);
     remoteTrackRecoveryTimers.set(key, timer);
@@ -447,64 +619,92 @@ export function useVoicePeers({
     return `${userId}:${source}`;
   }
 
-  async function receiveOffer(userId: string, offer: RTCSessionDescriptionInit) {
-    const peer = await ensurePeer(userId, false);
-    const offerCollision = makingOffers.has(userId) || peer.signalingState !== 'stable';
-    if (offerCollision && !isPolitePeer(userId)) {
-      ignoredOfferUsers.add(userId);
-      return;
-    }
-
-    ignoredOfferUsers.delete(userId);
-    if (offerCollision) {
-      pendingOffers.set(userId, mergeOfferOptions(pendingOffers.get(userId), undefined));
-      await peer.setLocalDescription({ type: 'rollback' }).catch(() => undefined);
-    }
-
-    await peer.setRemoteDescription(offer).catch(() => undefined);
-    const remoteOfferState = peer.signalingState as string;
-    if (remoteOfferState !== 'have-remote-offer') {
-      return;
-    }
-    await flushQueuedCandidates(userId, peer);
-
-    const answer = await peer.createAnswer();
-    await peer.setLocalDescription(answer).catch(() => undefined);
-    const answeredState = peer.signalingState as string;
-    if (answeredState !== 'stable') {
-      return;
-    }
-    sendSignal({
-      type: 'answer',
-      roomId: roomId(),
-      userId: currentUserId.value,
-      targetUserId: userId,
-      payload: answer,
+  async function receiveOffer(userId: string, offer: PeerDescription) {
+    await serialize(userId, async () => {
+      if (intentionallyClosed() || !getUsers().includes(userId)) return;
+      if (offer.sessionId && retiredSessions.get(userId)?.has(offer.sessionId)) {
+        diagnostic(userId, 'stale-offer');
+        return;
+      }
+      let peer = await ensurePeer(userId, false);
+      if (!isCurrent(userId, peer)) return;
+      const offerCollision = makingOffers.has(userId) || peer.signalingState !== 'stable';
+      if (offerCollision && !isPolitePeer(userId)) {
+        ignoredOfferUsers.add(userId);
+        diagnostic(userId, 'offer-collision-ignored');
+        return;
+      }
+      try {
+        if (offer.sessionId && offer.sessionId !== sessions.get(peer)) {
+          // Reset both ends of a rebuilt transport, not just the endpoint that
+          // noticed the failure. Keep candidates that arrived before this offer.
+          const candidates = (queuedCandidates.get(userId) ?? []).filter((item) => item.sessionId === offer.sessionId);
+          if (peer.localDescription || peer.remoteDescription) {
+            closePeer(userId, true);
+            peer = await ensurePeer(userId, false);
+          } else {
+            retireSession(userId, sessions.get(peer)!);
+          }
+          sessions.set(peer, offer.sessionId);
+          queuedCandidates.set(userId, candidates);
+        } else if (offerCollision) {
+          pendingOffers.set(userId, mergeOfferOptions(pendingOffers.get(userId), undefined));
+          await peer.setLocalDescription({ type: 'rollback' });
+        }
+        ignoredOfferUsers.delete(userId);
+        outstandingOffers.delete(peer);
+        await peer.setRemoteDescription(offer);
+        if (!isCurrent(userId, peer)) return;
+        await flushQueuedCandidates(userId, peer);
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        if (!isCurrent(userId, peer)) return;
+        sendSignal({ type: 'answer', roomId: roomId(), userId: currentUserId.value, targetUserId: userId,
+          payload: { ...answer, sessionId: offer.sessionId, offerId: offer.offerId } });
+        diagnostic(userId, 'offer-answered', { collision: offerCollision });
+      } catch (cause) { signalFailure(userId, peer, 'remote-offer-error', cause); }
     });
-    await flushPendingOffer(userId, peer);
+    const peer = peers.get(userId);
+    if (peer) await flushPendingOffer(userId, peer);
     await flushQueuedScreenShareOffer(userId);
   }
 
-  async function receiveCandidate(userId: string, candidate: RTCIceCandidateInit) {
-    if (ignoredOfferUsers.has(userId)) {
-      return;
-    }
+  async function receiveCandidate(userId: string, candidate: PeerCandidate) {
+    await serialize(userId, async () => {
+      if (intentionallyClosed() || !getUsers().includes(userId)) return;
+      if (candidate.sessionId && retiredSessions.get(userId)?.has(candidate.sessionId)) return;
+      if (!candidate.sessionId && ignoredOfferUsers.has(userId)) return;
+      const peer = peers.get(userId);
+      if (!peer || !peer.remoteDescription || (candidate.sessionId && candidate.sessionId !== sessions.get(peer))) {
+        const queued = queuedCandidates.get(userId) ?? [];
+        queued.push(candidate);
+        queuedCandidates.set(userId, queued.slice(-128));
+        return;
+      }
+      await addCandidate(userId, peer, candidate);
+    });
+  }
 
-    const peer = peers.get(userId);
-    if (!peer || !peer.remoteDescription) {
+  async function addCandidate(userId: string, peer: RTCPeerConnection, candidate: PeerCandidate) {
+    if (!isCurrent(userId, peer)) return;
+    // ICE restarts share a session but have new ICE credentials. Late candidates
+    // for an old offer must not be applied to the new negotiation.
+    if (candidate.usernameFragment && !peer.remoteDescription?.sdp.split(/\r?\n/).includes(`a=ice-ufrag:${candidate.usernameFragment}`)) {
+      // A candidate may beat its restart offer over signaling. Keep it until
+      // that description arrives; the bounded queue also tolerates stale ICE.
       const queued = queuedCandidates.get(userId) ?? [];
-      queued.push(candidate);
-      queuedCandidates.set(userId, queued);
+      queuedCandidates.set(userId, [...queued, candidate].slice(-128));
       return;
     }
-    await peer.addIceCandidate(candidate).catch(() => undefined);
+    try { await peer.addIceCandidate(candidate); }
+    catch (cause) { diagnostic(userId, 'ice-candidate-rejected', connectionErrorDetails(cause)); }
   }
 
   async function flushQueuedCandidates(userId: string, peer: RTCPeerConnection) {
     const queued = queuedCandidates.get(userId) ?? [];
     queuedCandidates.delete(userId);
     for (const candidate of queued) {
-      await peer.addIceCandidate(candidate).catch(() => undefined);
+      if (!candidate.sessionId || candidate.sessionId === sessions.get(peer)) await addCandidate(userId, peer, candidate);
     }
   }
 
@@ -544,16 +744,25 @@ export function useVoicePeers({
   }
 
   function attachRemoteTrackRecovery(userId: string, stream: MediaStream, source: 'mic' | 'screen', audio: HTMLAudioElement) {
+    const peer = peers.get(userId);
+    const active = () => !!peer && isCurrent(userId, peer) && audio.srcObject === stream && audio.isConnected;
     stream.getTracks().forEach((track) => {
-      track.addEventListener('mute', () => scheduleRemoteTrackRecovery(userId, source));
-      track.addEventListener('unmute', () => clearRemoteTrackRecovery(userId, source));
+      track.addEventListener('mute', () => {
+        if (active()) { diagnostic(userId, 'remote-track-muted', { source }); scheduleRemoteTrackRecovery(userId, source); }
+      });
+      track.addEventListener('unmute', () => { if (active()) clearRemoteTrackRecovery(userId, source); });
       track.addEventListener('ended', () => {
+        if (!active()) return;
+        diagnostic(userId, 'remote-track-ended', { source });
         clearRemoteTrackRecovery(userId, source);
         audio.remove();
         if (source === 'mic') {
           stopSpeakingDetection(userId);
+          peerRecoveryAttempts.set(userId, 2);
+          schedulePeerRecovery(userId, peer!, 3000, true);
         }
       });
+      if (track.muted) scheduleRemoteTrackRecovery(userId, source);
     });
   }
 
@@ -563,8 +772,11 @@ export function useVoicePeers({
         return;
       }
       void audio.play().then(
-        () => clearRemoteTrackRecovery(userId, source),
-        () => undefined,
+        () => {
+          const stream = audio.srcObject as MediaStream | null;
+          if (stream?.getAudioTracks().every((track) => !track.muted)) clearRemoteTrackRecovery(userId, source);
+        },
+        (cause) => diagnostic(userId, 'audio-playback-error', { source, ...connectionErrorDetails(cause) }),
       );
     };
 
@@ -611,12 +823,18 @@ export function useVoicePeers({
     }
   }
 
-  function closePeer(userId: string) {
+  function closePeer(userId: string, preserveSettings = false) {
     clearPeerRecovery(userId);
     clearPeerHeartbeat(userId);
     clearQueuedScreenShareOffer(userId);
-    peers.get(userId)?.close();
+    const peer = peers.get(userId);
     peers.delete(userId);
+    if (peer) {
+      retireSession(userId, sessions.get(peer)!);
+      peer.close();
+    }
+    window.clearInterval(monitors.get(userId));
+    monitors.delete(userId);
     queuedCandidates.delete(userId);
     makingOffers.delete(userId);
     pendingOffers.delete(userId);
@@ -624,8 +842,10 @@ export function useVoicePeers({
     peerRecoveryAttempts.delete(userId);
     clearRemoteTrackRecovery(userId);
     delete peerStates[userId];
-    delete memberVolumes[userId];
-    delete screenVolumes[userId];
+    if (!preserveSettings) {
+      delete memberVolumes[userId];
+      delete screenVolumes[userId];
+    }
     delete speakingUsers[userId];
     stopSpeakingDetection(userId);
     removeRemoteScreen(userId);

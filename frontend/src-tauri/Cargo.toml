@@ -1,6 +1,6 @@
 [package]
 name = "mikcort"
-version = "0.2.15"
+version = "0.2.16"
 description = "Lightweight desktop voice chat"
 authors = ["mikcort"]
 edition = "2021"

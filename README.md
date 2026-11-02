@@ -157,9 +157,20 @@ cmd /c npm run build
 cmd /c npm run test:audio
 cmd /c npm run test:screen
 cmd /c npm run test:ui
+cmd /c npm run test:recovery
 ```
 
 Ekran testleri sentetik goruntu ve sesle kalite secimini, gercek WebRTC gonderici parametrelerini, iptal/hata durumlarini ve ikinci bir yerel peer'de 1080p goruntunun alinmasini dogrular; kullanicinin ekranini yakalamaz.
+
+## Baglanti Kopmalarini Inceleme
+
+Oda basligindaki **Copy connection report** dugmesi son baglanti olaylarini JSON olarak panoya kopyalar. Sorun tekrarladiginda birbirini duyamayan iki kullanici da raporu hemen kopyalamali; olay saatini ve o sirada ekran paylasimi, ag degisikligi veya bilgisayarin uykudan uyanmasi olup olmadigini belirtmeli. Ortak `session` degeri iki rapordaki ayni kisi ciftini eslestirir.
+
+Rapor cihazda en fazla 1000 olay tutar; uygulama yeniden acilsa da son kayitlar korunur. Ses, sohbet, oda sifresi, kullanici adi, IP adresi ve SDP kaydedilmez, rapor otomatik olarak sunucuya gonderilmez. Kayitlar WebRTC/ICE durumlarini, ses paketi sayaclarini, paket kaybi/gecikmeyi, ses oynatma durumunu, mikrofon durumunu, signaling kopmalarini ve yeniden baglanma denemelerini icerir. `ice-candidate-error` tek basina tum baglantinin koptugu anlamina gelmez; secilen baglanti ve paket akisi ile birlikte degerlendirilmelidir.
+
+Yeniden baglanma once ICE restart dener; sonuc alinamazsa yalnizca ilgili kisi cifti icin yeni bir baglanti oturumu kurar. Yeni oturum kimlikleri gecikmis eski mesajlari ayirir. Eksik cevaplar, ilk baglantinin takilmasi ve signaling pong/oda katilim cevabinin gelmemesi zaman asimina tabidir. Bu degisiklikler iki istemcide de guncel surumle kullanilmalidir; TURN eklenmemistir.
+
+`test:recovery` gercek yerel WebRTC ve sentetik ses kullanir. Bes kisilik odada tek ciftin bozulmasi, tek/iki tarafli yeniden kurulum, kaybolan cevaplar, signaling kesintisi, ses track'inin durmasi ve heartbeat zaman asimini kontrollu olarak tetikler. Farkli operator/modemler arasindaki gercek kopmanin nedenini tek basina kanitlamaz; bunun icin olay anindaki iki istemci raporu gerekir.
 
 Ses testleri kurulu Chrome/Edge ile sentetik ses kullanir; fiziksel mikrofonu acmaz. Farkli bir Chromium kurulumu icin `MIKCORT_TEST_BROWSER` ortam degiskenini tarayicinin calistirilabilir dosyasina ayarla. Testler uretim CSP'si altinda gercek RNNoise WASM islemesini, hata durumlarini, mod degisimini ve mikrofon kaynaklarinin kapanmasini dogrular.
 

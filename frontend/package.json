@@ -1,6 +1,6 @@
 {
   "name": "mikcort",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "test:audio": "node --test tests/audio.test.mjs",
     "test:screen": "node --test tests/screen.test.mjs",
     "test:ui": "node --test tests/ui.test.mjs",
+    "test:recovery": "node --test tests/recovery.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

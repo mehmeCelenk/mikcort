@@ -16,6 +16,7 @@ import { useRoomChat } from '../features/voice/useRoomChat';
 import { useScreenShare } from '../features/voice/useScreenShare';
 import { useVoiceAudio } from '../features/voice/useVoiceAudio';
 import { useVoicePeers } from '../features/voice/useVoicePeers';
+import { connectionDiagnosticsReport, connectionErrorDetails, recordConnectionEvent } from '../features/voice/connectionDiagnostics';
 import { screenShareProfile } from '../features/voice/screenShareQuality';
 import type {
   ChatPayload,
@@ -79,6 +80,11 @@ let socket: WebSocket | null = null;
 let reconnectTimer: number | undefined;
 let heartbeatTimer: number | undefined;
 let errorTimer: number | undefined;
+let socketOpenTimer: number | undefined;
+let lastPong = 0;
+let roomJoined = false;
+const diagnosticsCopied = ref(false);
+let diagnosticsCopyTimer: number | undefined;
 let intentionallyClosed = false;
 const remoteAnalyzers = new Map<string, { context: AudioContext; timer: number }>();
 const speakingUntil = new Map<string, number>();
@@ -104,7 +110,7 @@ const {
   getLocalStream: () => localStream.value,
   getRemoteElementVolume: (audio) => remoteElementVolume(audio),
   getScreenStream: () => screenStream.value,
-  getSocketOpen: () => socket?.readyState === WebSocket.OPEN,
+  getSocketOpen: () => roomJoined && socket?.readyState === WebSocket.OPEN,
   getUsers: () => users.value,
   intentionallyClosed: () => intentionallyClosed,
   getScreenShareProfile: () => screenShareProfile(selectedScreenResolution.value, selectedScreenFps.value),
@@ -218,6 +224,9 @@ onMounted(() => {
   void startMicrophone();
   void loadDevices();
   window.addEventListener('keydown', handleKeydown);
+  window.addEventListener('online', handleOnline);
+  window.addEventListener('offline', handleOffline);
+  document.addEventListener('visibilitychange', handleVisibility);
   navigator.mediaDevices?.addEventListener('devicechange', loadDevices);
 });
 onBeforeUnmount(cleanup);
@@ -236,10 +245,29 @@ watch(error, (message) => {
 function connect() {
   clearReconnectTimer();
   clearHeartbeat();
-  intentionallyClosed = false;
-  socket = new WebSocket(props.serverUrl);
+  if (intentionallyClosed) return;
+  roomJoined = false;
+  const connection = new WebSocket(props.serverUrl);
+  socket = connection;
+  recordConnectionEvent('signaling-connecting');
+  socketOpenTimer = window.setTimeout(() => {
+    if (socket !== connection || connection.readyState === WebSocket.OPEN) return;
+    recordConnectionEvent('signaling-open-timeout');
+    connection.close();
+    scheduleReconnect();
+  }, 10_000);
 
   socket.addEventListener('open', () => {
+    if (socket !== connection || intentionallyClosed) return;
+    window.clearTimeout(socketOpenTimer);
+    lastPong = Date.now();
+    recordConnectionEvent('signaling-open');
+    socketOpenTimer = window.setTimeout(() => {
+      if (socket === connection && !roomJoined) {
+        recordConnectionEvent('room-join-timeout');
+        reconnectSignaling();
+      }
+    }, 10_000);
     wsOpen.value = true;
     error.value = '';
     status.value = micStarted.value ? 'Microphone is on.' : 'Joined room. Microphone is opening...';
@@ -256,15 +284,23 @@ function connect() {
   });
 
   socket.addEventListener('message', (event: MessageEvent<string>) => {
+    if (socket !== connection || intentionallyClosed) return;
     try {
-      void handleSignal(JSON.parse(event.data) as SignalMessage);
-    } catch {
+      void handleSignal(JSON.parse(event.data) as SignalMessage).catch((cause) => {
+        recordConnectionEvent('signaling-handler-error', connectionErrorDetails(cause));
+      });
+    } catch (cause) {
+      recordConnectionEvent('signaling-parse-error', connectionErrorDetails(cause));
       error.value = 'Received invalid signaling message.';
     }
   });
 
-  socket.addEventListener('close', () => {
+  socket.addEventListener('close', (event) => {
+    if (socket !== connection) return;
+    window.clearTimeout(socketOpenTimer);
     clearHeartbeat();
+    roomJoined = false;
+    recordConnectionEvent('signaling-close', { code: event.code, clean: event.wasClean });
     wsOpen.value = false;
     status.value = 'Disconnected from signaling server. Reconnecting...';
     if (!intentionallyClosed) {
@@ -273,11 +309,14 @@ function connect() {
   });
 
   socket.addEventListener('error', () => {
+    if (socket !== connection || intentionallyClosed) return;
+    recordConnectionEvent('signaling-error');
     error.value = 'Could not connect to the signaling server.';
   });
 }
 
 function scheduleReconnect() {
+  if (intentionallyClosed) return;
   clearReconnectTimer();
   reconnectTimer = window.setTimeout(() => {
     connect();
@@ -294,8 +333,46 @@ function clearReconnectTimer() {
 function startHeartbeat() {
   clearHeartbeat();
   heartbeatTimer = window.setInterval(() => {
+    if (Date.now() - lastPong > 35_000) {
+      recordConnectionEvent('signaling-pong-timeout', { silentMs: Date.now() - lastPong });
+      reconnectSignaling();
+      return;
+    }
     send({ type: 'ping', roomId: props.roomId, userId: currentUserId.value });
-  }, 20_000);
+  }, 10_000);
+}
+
+function reconnectSignaling() {
+  if (intentionallyClosed) return;
+  const previous = socket;
+  socket = null; // Ignore delayed events from the replaced socket.
+  roomJoined = false;
+  wsOpen.value = false;
+  clearHeartbeat();
+  window.clearTimeout(socketOpenTimer);
+  previous?.close();
+  scheduleReconnect();
+}
+
+function handleOnline() {
+  recordConnectionEvent('network-online');
+  if (!wsOpen.value || Date.now() - lastPong > 35_000) reconnectSignaling();
+}
+
+function handleOffline() { recordConnectionEvent('network-offline'); }
+function handleVisibility() {
+  recordConnectionEvent('visibility', { state: document.visibilityState });
+  if (document.visibilityState === 'visible') handleOnline();
+}
+
+async function copyConnectionReport() {
+  recordConnectionEvent('report-requested');
+  try {
+    await navigator.clipboard.writeText(connectionDiagnosticsReport());
+    diagnosticsCopied.value = true;
+    window.clearTimeout(diagnosticsCopyTimer);
+    diagnosticsCopyTimer = window.setTimeout(() => { diagnosticsCopied.value = false; }, 2500);
+  } catch { error.value = 'Could not copy the connection report.'; }
 }
 
 function clearHeartbeat() {
@@ -321,6 +398,9 @@ async function handleSignal(message: SignalMessage) {
   switch (message.type) {
     case 'room-users': {
       const payload = message.payload as RoomUsersPayload;
+      // The server tells other members to rebuild on rejoin. Rebuild this end
+      // too, rather than reuse the old SDP/ICE state with their new transport.
+      for (const userId of peers.keys()) closePeer(userId, true);
       if (message.userId) {
         const previousUserId = currentUserId.value;
         currentUserId.value = message.userId;
@@ -332,6 +412,9 @@ async function handleSignal(message: SignalMessage) {
       userNames[currentUserId.value] = payload.self?.displayName || props.displayName;
       const existingUsers = (payload.users ?? []).map(registerUser);
       users.value = unique([currentUserId.value, ...existingUsers]);
+      roomJoined = true;
+      window.clearTimeout(socketOpenTimer);
+      recordConnectionEvent('room-joined', { members: users.value.length });
       if (localStream.value) {
         for (const userId of otherUsers.value) {
           await ensurePeer(userId, true);
@@ -342,7 +425,7 @@ async function handleSignal(message: SignalMessage) {
     case 'user-joined':
       if (message.userId && message.userId !== currentUserId.value) {
         if (users.value.includes(message.userId)) {
-          closePeer(message.userId);
+          closePeer(message.userId, true);
         }
         registerUser((message.payload as UserSummary | undefined) ?? message.userId);
         users.value = unique([...users.value, message.userId]);
@@ -383,6 +466,7 @@ async function handleSignal(message: SignalMessage) {
       }
       break;
     case 'pong':
+      lastPong = Date.now();
       break;
     case 'error': {
       const payload = message.payload as ErrorPayload;
@@ -508,11 +592,17 @@ async function copyRoomId() {
 }
 function cleanup() {
   intentionallyClosed = true;
+  roomJoined = false;
+  window.clearTimeout(socketOpenTimer);
+  window.clearTimeout(diagnosticsCopyTimer);
   window.clearTimeout(copyTimer);
   clearErrorTimer();
   clearHeartbeat();
   clearReconnectTimer();
   window.removeEventListener('keydown', handleKeydown);
+  window.removeEventListener('online', handleOnline);
+  window.removeEventListener('offline', handleOffline);
+  document.removeEventListener('visibilitychange', handleVisibility);
   navigator.mediaDevices?.removeEventListener('devicechange', loadDevices);
   closeAllPeers();
   stopLocalAudio();
@@ -580,6 +670,8 @@ function stopSpeakingDetection(userId: string) {
 function send(message: SignalMessage) {
   if (socket?.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(message));
+  } else {
+    recordConnectionEvent('signaling-send-dropped', { type: message.type });
   }
 }
 
@@ -607,6 +699,7 @@ function initials(userId: string) {
       </div>
       <div class="stage-actions">
         <span class="connection-state" :title="status"><span :class="['dot', { online: wsOpen }]"></span>{{ connectionLabel }}</span>
+        <button type="button" class="icon-button quiet-button compact-button" aria-label="Copy connection report" :title="diagnosticsCopied ? 'Connection report copied' : 'Copy connection report'" @click.stop="copyConnectionReport"><Check v-if="diagnosticsCopied" :size="16" /><Copy v-else :size="16" /></button>
         <button type="button" class="chat-toggle" :class="{ active: chatOpen }" :aria-pressed="chatOpen" :aria-label="chatOpen ? 'Close chat' : 'Open chat'" :title="chatOpen ? 'Close chat' : 'Open chat'" @click.stop="toggleChat"><MessageSquare :size="18" /><span>Chat</span><strong v-if="unreadChatCount">{{ unreadChatCount }}</strong></button>
       </div>
     </header>

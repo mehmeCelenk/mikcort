@@ -2,6 +2,7 @@ import { ref, type ComputedRef, type Ref } from 'vue';
 import { usePersistentBoolean, usePersistentNumber, usePersistentString } from '../../composables/usePersistentStorage';
 import { readStoredBoolean } from '../../shared/storage';
 import { createMicrophonePipeline, normalizeNoiseSuppressionMode, type MicrophonePipeline } from './microphoneProcessing';
+import { connectionErrorDetails, recordConnectionEvent } from './connectionDiagnostics';
 
 type VoiceFeedback =
   | 'mute'
@@ -100,6 +101,7 @@ export function useVoiceAudio({
         await ensurePeer(userId, true);
       }
     } catch (err) {
+      recordConnectionEvent('microphone-start-error', connectionErrorDetails(err));
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         error.value = err instanceof Error ? err.message : 'Microphone permission failed.';
       }
@@ -132,6 +134,7 @@ export function useVoiceAudio({
       try {
         await restartMicrophone();
       } catch (err) {
+        recordConnectionEvent('microphone-settings-error', connectionErrorDetails(err));
         if (!(err instanceof DOMException && err.name === 'AbortError')) {
           micStarted.value = false;
           error.value = err instanceof Error ? err.message : 'Could not update microphone settings.';
@@ -198,6 +201,15 @@ export function useVoiceAudio({
     rawLocalStream.value = pipeline.rawStream;
     localStream.value = pipeline.stream;
     audioContext = pipeline.context;
+    recordConnectionEvent('microphone-open', { context: pipeline.context.state });
+    pipeline.context.addEventListener('statechange', () => {
+      recordConnectionEvent('microphone-context', { state: pipeline.context.state });
+    });
+    for (const track of pipeline.rawStream.getAudioTracks()) {
+      for (const event of ['mute', 'unmute', 'ended']) track.addEventListener(event, () => {
+        if (microphonePipeline === pipeline) recordConnectionEvent(`microphone-track-${event}`);
+      });
+    }
     micGainNode = pipeline.gain;
     micSensitivityNode = pipeline.sensitivityGain;
     micSensitivityAnalyser = pipeline.analyser;
@@ -296,6 +308,7 @@ export function useVoiceAudio({
     }
     updateRemoteAudioSettings();
     playVoiceFeedback(!wasMuted && muted.value ? 'mute' : 'unmute', wasDeafened);
+    recordConnectionEvent('audio-controls', { muted: muted.value, deafened: deafened.value });
   }
 
   function toggleDeafen() {
@@ -318,6 +331,7 @@ export function useVoiceAudio({
     }
     updateRemoteAudioSettings();
     playVoiceFeedback(nextDeafened ? 'deafen' : 'undeafen', wasDeafened);
+    recordConnectionEvent('audio-controls', { muted: muted.value, deafened: deafened.value });
   }
 
   function playVoiceFeedback(type: VoiceFeedback, wasDeafened = false) {
@@ -366,6 +380,7 @@ export function useVoiceAudio({
   }
 
   function stopLocalAudio() {
+    if (microphonePipeline) recordConnectionEvent('microphone-stopped');
     microphoneRequest?.abort();
     microphoneRequest = null;
     microphonePipeline?.destroy();
